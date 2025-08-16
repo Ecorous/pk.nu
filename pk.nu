@@ -84,51 +84,51 @@ def "__pknulib into system" []: record -> record {
 
 def "__pknulib into member" []: record -> record {
       if "created" in ($in | columns) { upsert created { into datetime } } else { $in }
-    | if "last_message_timestamp" in ($in | columns) { upsert last_message_timestamp { into datetime } } else { $in }
+    | if "last_message_timestamp" in ($in | columns) and ($in.last_message_timestamp | describe) != "nothing" { upsert last_message_timestamp { into datetime } } else { $in }
 }
 
 # handles system error checking
 #   true -> success
 #   false -> error
-def "__pknulib system-error-handler" [span: record<start: int, end: int>]: record -> bool {
-    let s = $in;
-    match $s.status {
-        404 => {
-            error make {
-                msg: "System not found",
-                label: {
-                    text: "could not find this system",
-                    span: $span
-                }
-            }
-            return false;
-        },
-        403 | 401 => {
-            error make {
-                msg: "Forbidden",
-                label: {
-                    text: "no permission - are you authenticated?",
-                    span: $span
-                }
-            }
-            return false;
-        },
-        200 => {
-            $s.body | __pknulib into system
-        }
-        _ => {
-            error make {
-                msg: "Unexpected response",
-                label: {
-                    text: $"got status ($s.status | to text) from the API",
-                    span: $span
-                }
-            }
-            return false;
-        }
-    }
-    true;
-}
+# def "__pknulib system-error-handler" [span: record<start: int, end: int>]: record -> bool {
+#     let s = $in;
+#     match $s.status {
+#         404 => {
+#             error make {
+#                 msg: "System not found",
+#                 label: {
+#                     text: "could not find this system",
+#                     span: $span
+#                 }
+#             }
+#             return false;
+#         },
+#         403 | 401 => {
+#             error make {
+#                 msg: "Forbidden",
+#                 label: {
+#                     text: "no permission - are you authenticated?",
+#                     span: $span
+#                 }
+#             }
+#             return false;
+#         },
+#         200 => {
+#             $s.body | __pknulib into system
+#         }
+#         _ => {
+#             error make {
+#                 msg: "Unexpected response",
+#                 label: {
+#                     text: $"got status ($s.status | to text) from the API",
+#                     span: $span
+#                 }
+#             }
+#             return false;
+#         }
+#     }
+#     true;
+# }
 
 def "__pknulib handle-request" [data_type: string, span: record<start: int, end: int>]: record -> record<success: bool, value: any> {
     let data = $in
@@ -230,7 +230,10 @@ def "pk member save" [--new]: record -> nothing {
 }
 
 def "pk members" [system: string = "@me"] {
-    __pknulib get $"/systems/($system)/members" | __pknulib handle-request system (metadata $system).span | each { __pknulib into member  }
+    let r = __pknulib get $"/systems/($system)/members" | __pknulib handle-request system (metadata $system).span
+    if $r.success {
+        $r.value | select -o ...($in | columns) | each { __pknulib into member }
+    }
 }
 
 # Get member `$member`
@@ -278,6 +281,21 @@ def "pk member delete" [member: string] {
     __pknulib delete $"/members/($member)" | __pknulib handle-request member (metadata $member).span | ignore
 }
 
+def "pk fronters" [...systems, --simple] {
+    $systems | each { |system|
+        let s = pk system $system
+        let r = __pknulib get $"/systems/($system)/fronters" | __pknulib handle-request system (metadata $system).span
+        if ($r.success) {
+            let data = $r.value.members | each { |row| if ($row.display_name | describe) == "nothing" { $row | upsert display_name $row.name } else {} }
+            
+            {id: $s.id, system: $s.name, fronters: $data.display_name, since: ($r.value?.timestamp | into datetime)}
+        }
+    } | if ($simple) { upsert system {|x| $x.system | str downcase } | upsert fronters { |ro| if ($ro.fronters | length) == 1 { $ro.fronters.0 } else { $ro.fronters } } | select system fronters | transpose -dir } else {}
+}
+
+# def "pk switch" [system: string, ...members: list<string>, --from: datetime] {
+    # let r = { members: $members } | if ($from | describe) == "nothing" { $in } else { $in | upsert timestamp { $from | __pknulib into pk-datetime } | __pknulib post $"/systems/($system)/switches" | __pknulib handle-request system (metadata $system).span
+# }
 
 # system deletion is not possible via the api
 # 
@@ -290,9 +308,11 @@ def "pk member delete" [member: string] {
 # }
 
 
-alias "pk system list" = pk members;
-alias "pk system l" = pk system list;
-alias "pk s l" = pk system list;
-alias "pk s" = pk system;
-alias "pk m rm" = pk member delete 
+alias "pk system list" = pk members
+alias "pk system l" = pk system list
+alias "pk s l" = pk system list
+alias "pk s" = pk system
+alias "pk m" = pk member
+alias "pk m rm" = pk member delete
 alias "pk m n" = pk member save --new
+# alias "pk sw" = pk switch;
