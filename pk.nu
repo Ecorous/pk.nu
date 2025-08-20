@@ -79,59 +79,47 @@ def "__pknulib into pk" [in_type: string]: record -> record {
 }
 
 def "__pknulib into system" []: record -> record {
-    if "created" in ($in | columns) { upsert created { into datetime } } else { $in }
+    if "created" in ($in | columns) { upsert created { into datetime } } else {}
 }
 
 def "__pknulib into member" []: record -> record {
-      if "created" in ($in | columns) { upsert created { into datetime } } else { $in }
+      if "created" in ($in | columns) { upsert created { into datetime } } else {}
     | if "last_message_timestamp" in ($in | columns) and ($in.last_message_timestamp | describe) != "nothing" { upsert last_message_timestamp { into datetime } } else { $in }
 }
 
-# handles system error checking
-#   true -> success
-#   false -> error
-# def "__pknulib system-error-handler" [span: record<start: int, end: int>]: record -> bool {
-#     let s = $in;
-#     match $s.status {
-#         404 => {
-#             error make {
-#                 msg: "System not found",
-#                 label: {
-#                     text: "could not find this system",
-#                     span: $span
-#                 }
-#             }
-#             return false;
-#         },
-#         403 | 401 => {
-#             error make {
-#                 msg: "Forbidden",
-#                 label: {
-#                     text: "no permission - are you authenticated?",
-#                     span: $span
-#                 }
-#             }
-#             return false;
-#         },
-#         200 => {
-#             $s.body | __pknulib into system
-#         }
-#         _ => {
-#             error make {
-#                 msg: "Unexpected response",
-#                 label: {
-#                     text: $"got status ($s.status | to text) from the API",
-#                     span: $span
-#                 }
-#             }
-#             return false;
-#         }
-#     }
-#     true;
-# }
+def "__pknulib into switch" []: record -> record {
+    if "timestamp" in ($in | columns) { upsert timestamp { into datetime } } else {}
+}
 
-def "__pknulib handle-request" [data_type: string, span: record<start: int, end: int>]: record -> record<success: bool, value: any> {
+def "__pknulib into switches" []: table -> table {
+    if "timestamp" in ($in | columns) { upsert timestamp { into datetime } } else {} 
+}
+
+def "__pknulib handle-spans" [spans: table<start: int, end: int>] {
+    {start: ($spans.start | math min), end: ($spans.end | math max)}
+}
+
+def "__pknulib handle-request" [data_type: string, span: oneof<record<start: int, end: int>,table<code: int, span: record<start: int, end: int>>>]: record -> record<success: bool, value: any> {
     let data = $in
+    let span = match ($span | describe) {
+        "table<code: int, span: record<start: int, end: int>>" | "table<code: int, span: record<start: int, end: int>> (stream)" | "list<any>" => {
+            $span
+            | where code == $data.status
+            | get -o span.0
+            | default ($span
+                       | where code == 0
+                       | get span.0)
+        },
+        "record<start: int, end: int>" => {
+            $span
+        },
+        _ => {
+            # print ($span | describe)
+            # print ($span | table -e)
+            error make {msg: "imposible!"}
+        }
+    }
+    # print $span
     match $data.status {
         404 => {
             error make {
@@ -139,7 +127,8 @@ def "__pknulib handle-request" [data_type: string, span: record<start: int, end:
                 label: {
                     text: $"could not find this ($data_type)"
                     span: $span
-                }
+                },
+                help: ($data.body | table -e)
             }
             return {success: false, value: {}}
         },
@@ -149,9 +138,30 @@ def "__pknulib handle-request" [data_type: string, span: record<start: int, end:
                 label: {
                     text: "no permission - are you authenticated?",
                     span: $span
-                }
+                },
+               help: ($data.body | table -e) 
             }
             return {success: false, value: {}}
+        },
+        400 => {
+            if ($data.body | describe --detailed).type == "record" and "code" in ($data.body | columns) and $data.body.code == 40004 {
+                error make {
+                    msg: "Member list is identical to current fronter list",
+                    label: {
+                        text: "member list is identical",
+                        span: $span
+                    }
+                }
+            } else {
+                error make {
+                    msg: "Bad request",
+                    label: {
+                        text: $"got status ($data.status | to text) from the API",
+                        span: $span
+                    },
+                    help: ($data.body | table -e)
+                }
+            }
         },
         200 | 204 => {
             return {success: true, value: $data.body}
@@ -162,7 +172,8 @@ def "__pknulib handle-request" [data_type: string, span: record<start: int, end:
                 label: {
                     text: $"got status ($data.status | to text) from the API",
                     span: $span
-                }
+                },
+                help: ($data.body | table -e)
             }
         }
         
@@ -195,14 +206,21 @@ def pk [] {
     help pk
 }
 
-def "pk system" [system: string = "@me"] {
+# Get a system
+def "pk system" [
+    system: string = "@me" # The system to get
+] {
     let s = __pknulib get $"/systems/($system)" -f true -e true | __pknulib handle-request system (metadata $system).span;
     if $s.success {
         $s.value | __pknulib into system
     }
 }
 
-def "pk groups" [system: string = "@me", --with-members] {
+# Gets all groups from a system
+def "pk groups" [
+    system: string = "@me", # The system to get the groups from
+    --with-members # Get the members of each group as well
+] {
     let s = __pknulib get $"/systems/($system)/groups?with_members=($with_members)" | __pknulib handle-request system (metadata $system).span
     if $s.success {
         if $with_members {
@@ -211,11 +229,16 @@ def "pk groups" [system: string = "@me", --with-members] {
     }
 }
 
+# Edits a system
 def "pk system save" []: record -> nothing {
-    __pknulib into pk system | __pknulib patch $"/systems/($in.id)" | __pknulib handle-request system (metadata $in.id).span | ignore
+    let i = $in
+    $i | __pknulib into pk system | __pknulib patch $"/systems/($i.id)" | __pknulib handle-request system (metadata $i.id).span | ignore
 }
 
-def "pk member save" [--new]: record -> nothing {
+# Edits a member, optionally creating a new one (`--new`)
+def "pk member save" [
+    --new # Creates a new member instead of editing an existing one
+]: record -> nothing {
     if $new {
         let r =  __pknulib post "/members" --full true -e true | __pknulib handle-request member (metadata $in).span
         if $r.success {
@@ -229,15 +252,29 @@ def "pk member save" [--new]: record -> nothing {
     }
 }
 
-def "pk members" [system: string = "@me"] {
-    let r = __pknulib get $"/systems/($system)/members" | __pknulib handle-request system (metadata $system).span
-    if $r.success {
-        $r.value | select -o ...($in | columns) | each { __pknulib into member }
+# List members of a system
+def "pk members" [
+    system: string = "@me", # The system to list the members of 
+     --with-groups # Whether to list the groups of the members
+] {
+    if ($with_groups) {
+        pk groups --with-members $system
+        | flatten -a members
+        | group-by members_id members_name --to-table
+        | rename id name groups
+        | update groups { select id name }
+    } else {
+        let r = __pknulib get $"/systems/($system)/members" | __pknulib handle-request system (metadata $system).span
+        if $r.success {
+            $r.value | select -o ...($in | columns) | each { __pknulib into member }
+        }
     }
 }
 
 # Get member `$member`
-def "pk member" [member: string] {
+def "pk member" [
+    member: string # The member to get
+] {
     let r = __pknulib get $"/members/($member)" -f true -e true | __pknulib handle-request member (metadata $member).span
     if ($r.success) {
         $r.value | __pknulib into member
@@ -245,15 +282,20 @@ def "pk member" [member: string] {
 }
 
 # Get groups of member `$member`
-def "pk member groups" [member: string]: nothing -> list<string> {
+def "pk member groups" [
+    member: string # The member to get the groups of
+]: nothing -> list<string> {
     let r = __pknulib get $"/members/($member)/groups" | __pknulib handle-request member (metadata $member).span
     if ($r.success) {
         $r.value
     }
 }
 
-# Add groups `$groups` to member `$in`
-def "pk groups add" [groups: list<string>]: string -> list<string> {
+# Add groups `$groups` to member `$member`
+def "pk groups add" [
+    member: string # The member to add the groups to
+    ...groups # The groups to add to member
+]: nothing -> list<string> {
     let r = $groups | __pknulib post $"/members/($in)/groups" | __pknulib handle-request member (metadata $in).span
     if ($r.success) {
         $r.value
@@ -281,21 +323,76 @@ def "pk member delete" [member: string] {
     __pknulib delete $"/members/($member)" | __pknulib handle-request member (metadata $member).span | ignore
 }
 
-def "pk fronters" [...systems, --simple] {
-    $systems | each { |system|
+# Get the current fronters for (a) system(s)
+def "pk fronters" [
+    ...systems, # The systems to get the fronters for (default: @me)
+    --simple # Display a simple format as a record of {$system: $fronters}
+] {
+    let systems_r = $systems | default ["@me"] | if ($in | is-empty) { append "@me" } else {}
+    $systems_r | each { |system|
         let s = pk system $system
         let r = __pknulib get $"/systems/($system)/fronters" | __pknulib handle-request system (metadata $system).span
         if ($r.success) {
-            let data = $r.value.members | each { |row| if ($row.display_name | describe) == "nothing" { $row | upsert display_name $row.name } else {} }
+            if ($r.value | is-empty) {} else {
+                let data = $r.value.members | each { |row| if ($row.display_name | describe) == "nothing" { $row | upsert display_name $row.name } else {} }
             
-            {id: $s.id, system: $s.name, fronters: $data.display_name, since: ($r.value?.timestamp | into datetime)}
+                {id: $s.id, system: $s.name, fronters: $data.display_name, since: ($r.value?.timestamp | into datetime)}
+            }
         }
-    } | if ($simple) { upsert system {|x| $x.system | str downcase } | upsert fronters { |ro| if ($ro.fronters | length) == 1 { $ro.fronters.0 } else { $ro.fronters } } | select system fronters | transpose -dir } else {}
+    } | if $simple and not ($in | is-empty) {
+            upsert system {|x| $x.system | str downcase }
+            | upsert fronters { |ro| if ($ro.fronters | length) == 1 { $ro.fronters.0 } else { $ro.fronters } }
+            | select system fronters
+            | transpose -dir
+        } else if ($systems | is-empty) and not ($in | is-empty) { get 0 } else {}
 }
 
-# def "pk switch" [system: string, ...members: list<string>, --from: datetime] {
-    # let r = { members: $members } | if ($from | describe) == "nothing" { $in } else { $in | upsert timestamp { $from | __pknulib into pk-datetime } | __pknulib post $"/systems/($system)/switches" | __pknulib handle-request system (metadata $system).span
-# }
+# Register a switch
+def "pk switch" [
+    ...members, # The members fronting
+    --system: string = "@me", # The system to register the switch in
+     --from: oneof<datetime,string> # The timestamp to register the switch (optional)
+] {
+    let r = { members: $members }
+    | if ($from | describe) == "nothing" { $in } else {
+        $in | upsert timestamp { $from | date to-timezone utc | __pknulib into pk-datetime }
+    } | __pknulib post $"/systems/($system)/switches" | __pknulib handle-request "system/member" [
+        {code: 0, span: (metadata $members).span},
+        {code: 404, span: (__pknulib handle-spans ([(metadata $members).span] | if ($system != "@me") { append (metadata $system).span } else {}))},
+        {code: 400, span: (metadata $members).span}
+    ]
+    if ($r.success) {
+        $r.value | __pknulib into switch 
+    }
+    # | __pknulib handle-request system (metadata $system).span
+}
+
+# Get the switches of a system (front history)
+def "pk switches" [
+    system: string = "@me" # The system to get the switches of
+    --before: datetime # Date to get the latest switch from
+    --limit: int = 100 # Number of switches to get (default 100)
+    --member-names=true # Include member names in the output (roughly 12x slower)
+] {
+    let before_query = if ($before | describe) == "nothing" {""} else {$"before=($before | __pknulib into pk-datetime | url encode)"}
+    let limit_query = $"limit=($limit)"
+    let r = __pknulib get $"/systems/($system)/switches?($limit_query)(if $before_query != "" {$"&($before_query)"} else { "" })"
+            | __pknulib handle-request "system" (__pknulib handle-spans ([(metadata $system).span]
+                                                 | if ($before | describe) != "nothing" { append (metadata $before).span } else {}
+                                                 | if $limit != 100 { append (metadata $limit).span } else {}
+                                                ))
+    if ($r.success) {
+        $r.value
+        | if ($member_names) {
+            if "members" in ($in | columns) {
+                upsert members { each { |member|
+                    pk member $member
+                    | select id name
+                }}
+            } else {}
+        } else {} | __pknulib into switches
+    }
+}
 
 # system deletion is not possible via the api
 # 
@@ -315,4 +412,6 @@ alias "pk s" = pk system
 alias "pk m" = pk member
 alias "pk m rm" = pk member delete
 alias "pk m n" = pk member save --new
-# alias "pk sw" = pk switch;
+alias "pk sw" = pk switch
+alias "pk fh" = pk switches
+alias "pk s fh" = pk switches
