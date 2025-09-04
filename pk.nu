@@ -274,10 +274,18 @@ def "pk members" [
 # Get member `$member`
 def "pk member" [
     member: string # The member to get
+    --system: string = "@me" # The system to use for names
 ] {
-    let r = __pknulib get $"/members/($member)" -f true -e true | __pknulib handle-request member (metadata $member).span
-    if ($r.success) {
-        $r.value | __pknulib into member
+    let x = pk members $system | where { |i|
+        ($i.name | str downcase) == ($member | str downcase) or ($i.id | str downcase) == ($member | str downcase)
+    }
+    if ($x | is-empty) {
+        let r = __pknulib get $"/members/($member)" -f true -e true | __pknulib handle-request member (metadata $member).span
+        if ($r.success) {
+            $r.value | __pknulib into member
+        }
+    } else {
+        $x.0
     }
 }
 
@@ -334,9 +342,9 @@ def "pk fronters" [
         let r = __pknulib get $"/systems/($system)/fronters" | __pknulib handle-request system (metadata $system).span
         if ($r.success) {
             if ($r.value | is-empty) {} else {
-                let data = $r.value.members | each { |row| if ($row.display_name | describe) == "nothing" { $row | upsert display_name $row.name } else {} }
+                let data = $r.value.members | each { |row| if ($row.display_name | describe) == "nothing" { $row | upsert display_name $row.name } else {} } | upsert description { |it| if ($it | describe) == "string" { $it | lines | get 0 } }
             
-                {id: $s.id, system: $s.name, fronters: $data.display_name, since: ($r.value?.timestamp | into datetime)}
+                {id: $s.id, system: $s.name, fronters: ($data | select id display_name description), since: ($r.value?.timestamp | into datetime)}
             }
         }
     } | if $simple and not ($in | is-empty) {
@@ -408,6 +416,9 @@ def "pk switches" [
 alias "pk system list" = pk members
 alias "pk system l" = pk system list
 alias "pk s l" = pk system list
+alias "pk list" = pk members
+alias "pk l" = pk list
+alias "pk ls" = pk list
 alias "pk s" = pk system
 alias "pk m" = pk member
 alias "pk m rm" = pk member delete
