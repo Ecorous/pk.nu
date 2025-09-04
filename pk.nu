@@ -274,7 +274,7 @@ def "pk members" [
 # Get member `$member`
 def "pk member" [
     member: string # The member to get
-    --system: string = "@me" # The system to use for names
+    --system(-s): string = "@me" # The system to use for names
 ] {
     let x = pk members $system | where { |i|
         ($i.name | str downcase) == ($member | str downcase) or ($i.id | str downcase) == ($member | str downcase)
